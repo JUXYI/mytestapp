@@ -11,8 +11,9 @@ import {
   SafeAreaProvider,
   useSafeAreaInsets,
 } from 'react-native-safe-area-context';
+import AppNavigator from './src/navigation';
 
-function App() {
+function App1() {
   const isDarkMode = useColorScheme() === 'dark';
 
   return (
@@ -35,6 +36,14 @@ function AppContent() {
     </View>
   );
 }
+
+const App = () => {
+  return (
+    <SafeAreaProvider>
+      <AppNavigator />
+    </SafeAreaProvider>
+  );
+};
 
 const styles = StyleSheet.create({
   container: {

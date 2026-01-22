@@ -16,6 +16,8 @@ export type RootStackParamList = {
   MainTab: undefined;
   Detail: { id: number; title: string };
   Login: undefined;
+  WebView: undefined;
+  WebView2: undefined;
 };
 
 // Stack 导航的 navigation 类型（比如 Login/Detail 页面的 navigation）

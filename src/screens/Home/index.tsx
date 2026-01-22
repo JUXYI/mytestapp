@@ -24,6 +24,22 @@ const HomeScreen = () => {
         title="跳转到我的页面"
         onPress={() => navigation.navigate('Profile')}
       />
+      <Button
+        title="跳转到登录页"
+        onPress={() => navigation.navigate('Login')}
+      />
+      <Button
+        title="跳转到 WebView 页"
+        onPress={() =>
+          navigation.navigate('WebView', { url: 'https://www.baidu.com' })
+        }
+      />
+      <Button
+        title="跳转到 WebView2 页"
+        onPress={() =>
+          navigation.navigate('WebView2', { url: 'https://www.baidu.com' })
+        }
+      />
     </View>
   );
 };

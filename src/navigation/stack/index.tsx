@@ -3,6 +3,8 @@ import { RootStackParamList } from '../types';
 import MainTabNavigator from '../tab';
 import DetailScreen from '../../screens/Detail';
 import LoginScreen from '../../screens/Login';
+import WebViewScreen from '../../screens/WebView';
+import WebViewNavigation from '../../screens/WebView2';
 
 const Stack = createStackNavigator<RootStackParamList>();
 
@@ -26,6 +28,18 @@ const RootStackNavigator = () => {
         name="Detail"
         component={DetailScreen}
         options={({ route }) => ({ title: route.params.title })}
+      />
+      {/* WebView 页 */}
+      <Stack.Screen
+        name="WebView"
+        component={WebViewScreen}
+        options={{ title: 'WebView 示例' }}
+      />
+      {/* WebView2 页 */}
+      <Stack.Screen
+        name="WebView2"
+        component={WebViewNavigation}
+        options={{ title: 'WebView2 示例' }}
       />
     </Stack.Navigator>
   );

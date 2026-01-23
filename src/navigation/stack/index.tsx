@@ -5,6 +5,7 @@ import DetailScreen from '../../screens/Detail';
 import LoginScreen from '../../screens/Login';
 import WebViewScreen from '../../screens/WebView';
 import WebViewNavigation from '../../screens/WebView2';
+import WebViewScreen3 from '../../screens/WebView3';
 
 const Stack = createStackNavigator<RootStackParamList>();
 
@@ -40,6 +41,11 @@ const RootStackNavigator = () => {
         name="WebView2"
         component={WebViewNavigation}
         options={{ title: 'WebView2 示例' }}
+      />
+      <Stack.Screen
+        name="WebView3"
+        component={WebViewScreen3}
+        options={{ title: 'WebView3 示例' }}
       />
     </Stack.Navigator>
   );

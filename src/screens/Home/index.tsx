@@ -40,6 +40,12 @@ const HomeScreen = () => {
           navigation.navigate('WebView2', { url: 'https://www.baidu.com' })
         }
       />
+      <Button
+        title="跳转到 WebView3 页"
+        onPress={() =>
+          navigation.navigate('WebView3', { url: 'https://www.baidu.com' })
+        }
+      />
     </View>
   );
 };

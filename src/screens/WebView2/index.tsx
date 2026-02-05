@@ -51,7 +51,7 @@ const WebViewNavigation = () => {
     if (url === 'myapp://webview2') {
       // 这里可以导航到第二个WebView
       // 例如：navigation.navigate('SecondWebViewScreen');
-      navigation.navigate('WebView');
+      navigation.navigate('WebView3');
       console.log('导航到第二个WebView');
     }
   };

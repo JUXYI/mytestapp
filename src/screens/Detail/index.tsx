@@ -1,5 +1,6 @@
 import { View, Text, StyleSheet, Button } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
+import InAppBrowser from 'react-native-inappbrowser-reborn';
 import type {
   RootNavigationProp,
   RootStackParamList,
@@ -11,6 +12,16 @@ const DetailScreen = () => {
   // 给 useRoute 指定类型：获取 Detail 页面的参数
   //const route = useRoute<RootStackScreenProps<'Detail'>['route']>();
   const route = useRoute<RouteProp<RootStackParamList, 'Detail'>>();
+
+  const openBaidu = async () => {
+    try {
+      const url = 'https://www.baidu.com';
+      const result = await InAppBrowser.open(url);
+      console.log('Browser closed with result:', result);
+    } catch (error) {
+      console.error('Failed to open browser:', error);
+    }
+  };
   const navigation = useNavigation<RootNavigationProp>();
 
   const { id, title } = route.params;
@@ -28,6 +39,7 @@ const DetailScreen = () => {
           })
         }
       />
+      <Button title="打开百度" onPress={openBaidu} />
     </View>
   );
 };

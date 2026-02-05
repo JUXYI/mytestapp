@@ -34,6 +34,25 @@ interface MyProps {
   children?: React.ReactNode;
 }
 
+// 拼接注入的 JS 代码：创建 style 标签并插入 CSS
+const injectCSS = `
+    (function() {
+      var style = document.createElement('style');
+      style.type = 'text/css';
+      style.innerHTML = \`
+        #header{ display: none !important; }
+        footer{ display: none !important; }
+        #footer{ display: none !important; }
+        .header_inner{ display: none !important; }
+        #header{ background-color: rgb(255 255 255);}
+        #contents.cf{ display: none !important; }
+        .p100{margin-bottom:0px;}
+      \`;
+      document.head.appendChild(style);
+    })();
+    true; // 必须返回一个值，否则 iOS 会报错
+  `;
+
 const ViewBoxesWithColorAndText = (props: MyProps): React.ReactNode => {
   const safeAreaInsets = useSafeAreaInsets();
 

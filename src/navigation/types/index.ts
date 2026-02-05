@@ -19,6 +19,7 @@ export type RootStackParamList = {
   WebView: undefined;
   WebView2: undefined;
   WebView3: undefined;
+  BingWebView: undefined;
 };
 
 // Stack 导航的 navigation 类型（比如 Login/Detail 页面的 navigation）

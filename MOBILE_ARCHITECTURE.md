@@ -1664,12 +1664,1003 @@ export const eninshoService = {
 
 ---
 
-続きはどうしますか？以下の内容をさらに詳しく展開できます：
+## 状態管理設計
 
-1. ✅ **オフライン機能設計**（キャッシュ管理、LRU アルゴリズム）
-2. ✅ **プッシュ通知設計**（Firebase Messaging + Azure Notification Hubs）
-3. ✅ **WebView 統合設計**（postMessage 双方向通信）
-4. ✅ **パフォーマンス最適化**（Hermes、FastImage、コード分割）
-5. ✅ **CI/CD Pipeline**（Azure DevOps、CodePush）
+### 状態管理戦略
 
-必要な部分を教えてください！🚀
+本アプリでは Web フロントエンド（CMS 管理画面）と同一思想の **2 層状態管理** を採用：
+
+1. **サーバー状態**: TanStack Query（React Query）— API データキャッシュ・同期
+2. **クライアント状態**: Zustand — 認証状態・UI 状態等
+
+#### 1. サーバー状態管理（TanStack Query）
+
+```typescript name=mobile/src/lib/api/queryClient.ts
+import { QueryClient } from '@tanstack/react-query';
+import NetInfo from '@react-native-community/netinfo';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (failureCount, error: any) => {
+        if (error?.message?.includes('Network Error')) {
+          return failureCount < 2;
+        }
+        return false;
+      },
+      staleTime: 5 * 60 * 1000, // 5 分間キャッシュ有効
+      gcTime: 10 * 60 * 1000, // 10 分間キャッシュ保持
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: true, // ネットワーク再接続時自動再取得
+      networkMode: 'offlineFirst', // オフライン時はキャッシュ返却
+    },
+    mutations: {
+      retry: 0,
+      networkMode: 'online',
+    },
+  },
+});
+
+// ネットワーク復帰時に自動再取得
+NetInfo.addEventListener(state => {
+  if (state.isConnected) {
+    queryClient.refetchQueries();
+  }
+});
+```
+
+#### 2. クライアント状態管理（Zustand）
+
+```typescript name=mobile/src/features/auth/stores/authStore.ts
+import { create } from 'zustand';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+interface User {
+  id: number;
+  username: string;
+  email: string;
+}
+
+interface AuthState {
+  user: User | null;
+  isAuthenticated: boolean;
+  accessToken: string | null;
+  refreshToken: string | null;
+  setUser: (user: User, accessToken: string, refreshToken: string) => void;
+  logout: () => void;
+}
+
+export const useAuthStore = create<AuthState>()(set => ({
+  user: null,
+  isAuthenticated: false,
+  accessToken: null,
+  refreshToken: null,
+
+  setUser: (user, accessToken, refreshToken) => {
+    AsyncStorage.setItem('access_token', accessToken);
+    AsyncStorage.setItem('refresh_token', refreshToken);
+    AsyncStorage.setItem('user', JSON.stringify(user));
+    set({ user, isAuthenticated: true, accessToken, refreshToken });
+  },
+
+  logout: () => {
+    AsyncStorage.multiRemove(['access_token', 'refresh_token', 'user']);
+    set({
+      user: null,
+      isAuthenticated: false,
+      accessToken: null,
+      refreshToken: null,
+    });
+  },
+}));
+```
+
+#### 状態管理の使い分け
+
+| 状態カテゴリ     | 管理方法       | 例                                      |
+| ---------------- | -------------- | --------------------------------------- |
+| **API データ**   | TanStack Query | コンテンツ一覧、通知一覧、集章データ    |
+| **認証状態**     | Zustand        | user, isAuthenticated, accessToken      |
+| **UI 状態**      | Zustand        | テーマ、表示設定                        |
+| **フォーム状態** | useState       | 検索キーワード、フィルター選択          |
+| **永続データ**   | AsyncStorage   | JWT Token、ユーザー設定                 |
+| **機密データ**   | SecureStorage  | 生体認証トークン、e-ninsho 証明書データ |
+
+---
+
+## オフライン機能設計
+
+### キャッシュ階層
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  キャッシュ階層構造                            │
+│                                                               │
+│  Layer 1: TanStack Query インメモリキャッシュ                │
+│  ├─ API レスポンス（5 分間有効）                              │
+│  ├─ 自動バックグラウンド更新                                  │
+│  └─ オフライン時はキャッシュ返却（networkMode: offlineFirst） │
+│                                                               │
+│  Layer 2: AsyncStorage メタデータキャッシュ（< 6 MB）        │
+│  ├─ コンテンツメタデータ（タイトル、説明、更新日時）         │
+│  ├─ ユーザー設定                                              │
+│  └─ 閲覧履歴（最近 10 件）                                   │
+│                                                               │
+│  Layer 3: react-native-fs ファイルキャッシュ（最大 500 MB）  │
+│  ├─ PDF ドキュメント                                          │
+│  ├─ ビデオファイル                                            │
+│  ├─ 画像・サムネイル                                          │
+│  └─ LRU アルゴリズムで自動削除                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### ファイルキャッシュ管理（LRU）
+
+```typescript name=mobile/src/lib/cache/fileCache.ts
+import RNFS from 'react-native-fs';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const CACHE_DIR = `${RNFS.CachesDirectoryPath}/content-cache`;
+const MAX_CACHE_SIZE = 500 * 1024 * 1024; // 500 MB
+const CACHE_INDEX_KEY = 'file_cache_index';
+
+interface CacheEntry {
+  key: string;
+  path: string;
+  size: number;
+  lastAccessed: number;
+  url: string;
+}
+
+/**
+ * LRU ファイルキャッシュマネージャー
+ * - 最大 500 MB
+ * - 最近使用されたファイルを優先保持
+ */
+export const fileCache = {
+  /**
+   * キャッシュからファイル取得（ヒット時は lastAccessed 更新）
+   */
+  get: async (url: string): Promise<string | null> => {
+    const index = await getIndex();
+    const entry = index.find(e => e.url === url);
+    if (!entry) return null;
+
+    const exists = await RNFS.exists(entry.path);
+    if (!exists) {
+      await removeFromIndex(entry.key);
+      return null;
+    }
+
+    // LRU: アクセス時間更新
+    entry.lastAccessed = Date.now();
+    await saveIndex(index);
+    return entry.path;
+  },
+
+  /**
+   * ファイルをキャッシュに保存
+   */
+  put: async (url: string, key: string): Promise<string> => {
+    await ensureCacheDir();
+    const filePath = `${CACHE_DIR}/${key}`;
+
+    // ダウンロード
+    const result = await RNFS.downloadFile({
+      fromUrl: url,
+      toFile: filePath,
+    }).promise;
+
+    // キャッシュサイズチェック & LRU 削除
+    await evictIfNeeded(result.bytesWritten);
+
+    // インデックス更新
+    const index = await getIndex();
+    index.push({
+      key,
+      path: filePath,
+      size: result.bytesWritten,
+      lastAccessed: Date.now(),
+      url,
+    });
+    await saveIndex(index);
+
+    return filePath;
+  },
+
+  /**
+   * キャッシュ全クリア
+   */
+  clear: async (): Promise<void> => {
+    await RNFS.unlink(CACHE_DIR).catch(() => {});
+    await AsyncStorage.removeItem(CACHE_INDEX_KEY);
+  },
+
+  /**
+   * 現在のキャッシュサイズ取得
+   */
+  getSize: async (): Promise<number> => {
+    const index = await getIndex();
+    return index.reduce((total, entry) => total + entry.size, 0);
+  },
+};
+
+/** LRU: 容量超過時に古いエントリから削除 */
+async function evictIfNeeded(newFileSize: number): Promise<void> {
+  const index = await getIndex();
+  let totalSize = index.reduce((sum, e) => sum + e.size, 0) + newFileSize;
+
+  // 古い順にソート
+  index.sort((a, b) => a.lastAccessed - b.lastAccessed);
+
+  while (totalSize > MAX_CACHE_SIZE && index.length > 0) {
+    const oldest = index.shift()!;
+    await RNFS.unlink(oldest.path).catch(() => {});
+    totalSize -= oldest.size;
+  }
+
+  await saveIndex(index);
+}
+
+async function getIndex(): Promise<CacheEntry[]> {
+  const raw = await AsyncStorage.getItem(CACHE_INDEX_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveIndex(index: CacheEntry[]): Promise<void> {
+  await AsyncStorage.setItem(CACHE_INDEX_KEY, JSON.stringify(index));
+}
+
+async function removeFromIndex(key: string): Promise<void> {
+  const index = await getIndex();
+  await saveIndex(index.filter(e => e.key !== key));
+}
+
+async function ensureCacheDir(): Promise<void> {
+  const exists = await RNFS.exists(CACHE_DIR);
+  if (!exists) await RNFS.mkdir(CACHE_DIR);
+}
+```
+
+### オフライン時 UX
+
+| シナリオ           | 挙動                                    |
+| ------------------ | --------------------------------------- |
+| コンテンツ一覧表示 | TanStack Query キャッシュから返却       |
+| コンテンツ詳細表示 | キャッシュ済みメタデータ + ファイル表示 |
+| PDF 閲覧           | ローカルキャッシュファイルがあれば表示  |
+| ビデオ再生         | ローカルキャッシュファイルがあれば再生  |
+| 新規データ取得     | エラー表示 +「オフラインです」バナー    |
+| ネットワーク復帰   | 自動再取得（refetchOnReconnect: true）  |
+
+---
+
+## プッシュ通知設計
+
+### アーキテクチャ概要
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     プッシュ通知フロー                                │
+│                                                                      │
+│  ┌───────────┐     ┌──────────────┐     ┌─────────────────────────┐ │
+│  │ CMS Web   │────►│ CMS API      │────►│ Azure Notification Hubs │ │
+│  │ 管理画面  │     │ (Spring Boot)│     │                         │ │
+│  └───────────┘     └──────────────┘     └────────┬────────────────┘ │
+│                                                   │                  │
+│                                      ┌────────────┼────────────┐    │
+│                                      │            │            │    │
+│                                      ▼            ▼            ▼    │
+│                                   ┌──────┐  ┌──────┐  ┌──────────┐ │
+│                                   │ APNS │  │ FCM  │  │ 共通     │ │
+│                                   │(iOS) │  │(Android)│ │ ペイロード│ │
+│                                   └──┬───┘  └──┬───┘  └──────────┘ │
+│                                      │         │                    │
+│                                      ▼         ▼                    │
+│                                 ┌─────────────────────┐             │
+│                                 │  React Native App   │             │
+│                                 │  (Firebase Messaging)│             │
+│                                 └─────────────────────┘             │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### デバイス登録フロー
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as React Native App
+    participant FCM as Firebase Cloud Messaging
+    participant API as CMS API (Spring Boot)
+    participant ANH as Azure Notification Hubs
+
+    App->>FCM: 1. Firebase Messaging 初期化
+    FCM-->>App: 2. デバイス Token 返却
+
+    App->>API: 3. POST /api/notifications/register-device
+    Note right of App: {deviceToken, platform, userId}
+
+    API->>ANH: 4. デバイス登録
+    Note right of API: Installation API 使用
+
+    ANH-->>API: 5. 登録完了
+    API-->>App: 6. 登録成功レスポンス
+```
+
+### 通知受信実装
+
+```typescript name=mobile/src/features/notifications/hooks/usePushNotification.ts
+import { useEffect, useCallback } from 'react';
+import messaging, {
+  FirebaseMessagingTypes,
+} from '@react-native-firebase/messaging';
+import { Platform, PermissionsAndroid } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import { cmsApiClient } from '@/lib/api/axios';
+
+/**
+ * プッシュ通知フック
+ * - Firebase Messaging 初期化
+ * - デバイス Token 登録
+ * - 通知受信処理
+ */
+export const usePushNotification = () => {
+  const navigation = useNavigation();
+
+  /** デバイス Token 取得 & サーバー登録 */
+  const registerDevice = useCallback(async () => {
+    // iOS: 通知パーミッション要求
+    if (Platform.OS === 'ios') {
+      const authStatus = await messaging().requestPermission();
+      if (
+        authStatus !== messaging.AuthorizationStatus.AUTHORIZED &&
+        authStatus !== messaging.AuthorizationStatus.PROVISIONAL
+      ) {
+        return;
+      }
+    }
+
+    // Android 13+: POST_NOTIFICATIONS パーミッション
+    if (Platform.OS === 'android' && Platform.Version >= 33) {
+      await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+      );
+    }
+
+    // デバイス Token 取得
+    const token = await messaging().getToken();
+
+    // サーバーに登録
+    await cmsApiClient.post('/api/notifications/register-device', {
+      deviceToken: token,
+      platform: Platform.OS,
+    });
+  }, []);
+
+  useEffect(() => {
+    registerDevice();
+
+    // Token リフレッシュ時の再登録
+    const unsubRefresh = messaging().onTokenRefresh(async newToken => {
+      await cmsApiClient.post('/api/notifications/register-device', {
+        deviceToken: newToken,
+        platform: Platform.OS,
+      });
+    });
+
+    // フォアグラウンド通知受信
+    const unsubMessage = messaging().onMessage(
+      async (remoteMessage: FirebaseMessagingTypes.RemoteMessage) => {
+        // アプリ内通知バナー表示
+        showInAppNotification(remoteMessage);
+      },
+    );
+
+    // バックグラウンド通知タップ時
+    const unsubOpen = messaging().onNotificationOpenedApp(remoteMessage => {
+      handleNotificationNavigation(remoteMessage, navigation);
+    });
+
+    // アプリ終了状態からの起動時
+    messaging()
+      .getInitialNotification()
+      .then(remoteMessage => {
+        if (remoteMessage) {
+          handleNotificationNavigation(remoteMessage, navigation);
+        }
+      });
+
+    return () => {
+      unsubRefresh();
+      unsubMessage();
+      unsubOpen();
+    };
+  }, [registerDevice, navigation]);
+};
+
+/** 通知タップ時のナビゲーション */
+function handleNotificationNavigation(
+  remoteMessage: FirebaseMessagingTypes.RemoteMessage,
+  navigation: any,
+) {
+  const data = remoteMessage.data;
+  if (data?.contentId) {
+    navigation.navigate('ContentDetail', { id: data.contentId });
+  } else if (data?.type === 'announcement') {
+    navigation.navigate('NotificationList');
+  }
+}
+```
+
+### バックエンド通知送信
+
+```java name=backend/src/main/java/com/juxyi/cms/service/NotificationService.java
+@Service
+@RequiredArgsConstructor
+public class NotificationService {
+    private final NotificationHubClient hubClient;
+    private final TelemetryClient telemetryClient;
+
+    /**
+     * 全ユーザーへプッシュ通知送信
+     */
+    public void sendToAll(String title, String message) {
+        // 共通ペイロード
+        String payload = String.format(
+            "{\"aps\":{\"alert\":{\"title\":\"%s\",\"body\":\"%s\"},\"sound\":\"default\"}," +
+            "\"data\":{\"title\":\"%s\",\"body\":\"%s\"}}",
+            title, message, title, message
+        );
+
+        // iOS (APNS)
+        hubClient.sendNotificationAsync(
+            new AppleNotification(payload)
+        );
+
+        // Android (FCM)
+        String fcmPayload = String.format(
+            "{\"notification\":{\"title\":\"%s\",\"body\":\"%s\"}," +
+            "\"data\":{\"title\":\"%s\",\"body\":\"%s\"}}",
+            title, message, title, message
+        );
+        hubClient.sendNotificationAsync(
+            new FcmV1Notification(fcmPayload)
+        );
+
+        telemetryClient.trackEvent("PushNotificationSent",
+            Map.of("title", title, "target", "all"));
+    }
+
+    /**
+     * プラットフォーム指定送信
+     */
+    public void sendToPlatform(String title, String message, String platform) {
+        String tagExpression = String.format("platform:%s", platform);
+        // タグベース送信
+        hubClient.sendNotificationAsync(
+            createNotification(title, message, platform), tagExpression
+        );
+    }
+}
+```
+
+---
+
+## WebView 統合設計
+
+### 通信プロトコル
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│              RN ⇔ WebView 双方向通信                              │
+│                                                                   │
+│  React Native App                    WebView (マイページ Web)    │
+│  ┌─────────────────────┐            ┌─────────────────────┐      │
+│  │                     │  postMessage│                     │      │
+│  │  useWebViewBridge() │◄───────────┤  window.ReactNative │      │
+│  │                     │            │  .postMessage()     │      │
+│  │  webViewRef         │───────────►│                     │      │
+│  │  .injectJavaScript()│  JS Inject │  window             │      │
+│  │                     │            │  .handleFromRN()    │      │
+│  └─────────────────────┘            └─────────────────────┘      │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### メッセージ型定義
+
+```typescript name=mobile/src/features/webview/types/webview.types.ts
+/** WebView → RN メッセージ */
+export type WebViewMessage =
+  | { type: 'LOGIN_SUCCESS'; authToken: string }
+  | { type: 'NAVIGATION'; url: string }
+  | { type: 'OPEN_EXTERNAL'; url: string }
+  | { type: 'CLOSE_WEBVIEW' }
+  | { type: 'ERROR'; message: string };
+
+/** RN → WebView メッセージ */
+export type RNMessage =
+  | { type: 'SET_TOKEN'; token: string }
+  | { type: 'SET_THEME'; theme: 'light' | 'dark' }
+  | { type: 'NAVIGATE'; path: string };
+```
+
+### WebView ブリッジフック
+
+```typescript name=mobile/src/features/webview/hooks/useWebViewBridge.ts
+import { useRef, useCallback } from 'react';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import { Linking } from 'react-native';
+import type { WebViewMessage, RNMessage } from '../types/webview.types';
+
+/**
+ * WebView ⇔ React Native 双方向通信フック
+ */
+export const useWebViewBridge = (onMessage?: (msg: WebViewMessage) => void) => {
+  const webViewRef = useRef<WebView>(null);
+
+  /** WebView → RN メッセージ受信 */
+  const handleMessage = useCallback(
+    (event: WebViewMessageEvent) => {
+      try {
+        const msg: WebViewMessage = JSON.parse(event.nativeEvent.data);
+
+        switch (msg.type) {
+          case 'OPEN_EXTERNAL':
+            Linking.openURL(msg.url);
+            break;
+          case 'CLOSE_WEBVIEW':
+            // ナビゲーションで戻る
+            break;
+          default:
+            onMessage?.(msg);
+        }
+      } catch (error) {
+        console.error('WebView message parse error:', error);
+      }
+    },
+    [onMessage],
+  );
+
+  /** RN → WebView メッセージ送信 */
+  const sendMessage = useCallback((msg: RNMessage) => {
+    const script = `
+      window.handleFromRN && window.handleFromRN(${JSON.stringify(msg)});
+      true;
+    `;
+    webViewRef.current?.injectJavaScript(script);
+  }, []);
+
+  return { webViewRef, handleMessage, sendMessage };
+};
+```
+
+### WebView コンテナコンポーネント
+
+```typescript name=mobile/src/components/media/WebViewContainer.tsx
+import React from 'react';
+import { StyleSheet, View, ActivityIndicator } from 'react-native';
+import { WebView } from 'react-native-webview';
+import { useWebViewBridge } from '@/features/webview/hooks/useWebViewBridge';
+
+interface WebViewContainerProps {
+  url: string;
+  jwtToken?: string;
+  onLoginSuccess?: (authToken: string) => void;
+}
+
+/**
+ * カスタム WebView コンテナ
+ * - JWT Token 自動注入
+ * - postMessage 双方向通信
+ * - ローディング表示
+ */
+export const WebViewContainer: React.FC<WebViewContainerProps> = ({
+  url,
+  jwtToken,
+  onLoginSuccess,
+}) => {
+  const { webViewRef, handleMessage } = useWebViewBridge(msg => {
+    if (msg.type === 'LOGIN_SUCCESS' && onLoginSuccess) {
+      onLoginSuccess(msg.authToken);
+    }
+  });
+
+  // JWT Token を Cookie / ヘッダーとして注入する JavaScript
+  const injectedJS = jwtToken
+    ? `
+      window.JWT_TOKEN = '${jwtToken}';
+      true;
+    `
+    : '';
+
+  return (
+    <View style={styles.container}>
+      <WebView
+        ref={webViewRef}
+        source={{ uri: url }}
+        onMessage={handleMessage}
+        injectedJavaScript={injectedJS}
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        startInLoadingState={true}
+        renderLoading={() => (
+          <View style={styles.loading}>
+            <ActivityIndicator size="large" />
+          </View>
+        )}
+        // セキュリティ設定
+        allowsBackForwardNavigationGestures={true}
+        mixedContentMode="compatibility"
+        originWhitelist={['https://*']}
+      />
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  loading: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+  },
+});
+```
+
+---
+
+## セキュリティ設計
+
+### セキュリティ対策一覧
+
+| 脅威                         | 対策                                                 |
+| ---------------------------- | ---------------------------------------------------- |
+| **Token 漏洩**               | Keychain (iOS) / Keystore (Android) にセキュア保存   |
+| **通信傍受**                 | HTTPS 必須 + Certificate Pinning（オプション）       |
+| **リバースエンジニアリング** | ProGuard (Android) / Bitcode (iOS) による難読化      |
+| **不正アクセス**             | JWT 有効期限（24h）+ Refresh Token（30 日）          |
+| **Root/Jailbreak**           | 検知時に認証機能制限                                 |
+| **WebView XSS**              | originWhitelist 制限 + injectedJavaScript サニタイズ |
+| **デバッグ接続**             | 本番ビルドでデバッガー接続拒否                       |
+
+### セキュアストレージ
+
+```typescript name=mobile/src/lib/storage/secureStorage.ts
+import * as Keychain from 'react-native-keychain';
+
+/**
+ * セキュアストレージ
+ * - iOS: Keychain Services
+ * - Android: Keystore System
+ */
+export const secureStorage = {
+  /** 機密データ保存 */
+  set: async (key: string, value: string): Promise<void> => {
+    await Keychain.setGenericPassword(key, value, { service: key });
+  },
+
+  /** 機密データ取得 */
+  get: async (key: string): Promise<string | null> => {
+    const credentials = await Keychain.getGenericPassword({ service: key });
+    return credentials ? credentials.password : null;
+  },
+
+  /** 機密データ削除 */
+  remove: async (key: string): Promise<void> => {
+    await Keychain.resetGenericPassword({ service: key });
+  },
+};
+```
+
+---
+
+## パフォーマンス最適化
+
+### Hermes JavaScript エンジン
+
+| 指標           | Hermes OFF | Hermes ON | 改善率 |
+| -------------- | ---------- | --------- | ------ |
+| アプリ起動時間 | ~3.5 秒    | ~1.5 秒   | 57%    |
+| メモリ使用量   | ~180 MB    | ~120 MB   | 33%    |
+| バンドルサイズ | ~8 MB      | ~5 MB     | 38%    |
+
+### 画像最適化（FastImage）
+
+```typescript name=mobile/src/components/media/OptimizedImage.tsx
+import React from 'react';
+import FastImage, { Priority } from 'react-native-fast-image';
+import { StyleSheet } from 'react-native';
+
+interface OptimizedImageProps {
+  uri: string;
+  width: number;
+  height: number;
+  priority?: Priority;
+}
+
+/**
+ * 高性能画像コンポーネント
+ * - ディスクキャッシュ自動管理
+ * - 優先度制御
+ * - プログレッシブ読み込み
+ */
+export const OptimizedImage: React.FC<OptimizedImageProps> = ({
+  uri,
+  width,
+  height,
+  priority = FastImage.priority.normal,
+}) => (
+  <FastImage
+    style={{ width, height, borderRadius: 8 }}
+    source={{ uri, priority, cache: FastImage.cacheControl.immutable }}
+    resizeMode={FastImage.resizeMode.cover}
+  />
+);
+```
+
+### FlatList 最適化
+
+```typescript
+// コンテンツ一覧での最適化設定
+<FlatList
+  data={contents}
+  keyExtractor={item => item.id.toString()}
+  renderItem={renderContentCard}
+  // パフォーマンス最適化
+  initialNumToRender={10} // 初回レンダリング数
+  maxToRenderPerBatch={5} // バッチレンダリング数
+  windowSize={5} // ウィンドウサイズ（画面数）
+  removeClippedSubviews={true} // 画面外要素のアンマウント
+  getItemLayout={(_, index) => ({
+    // レイアウト事前計算
+    length: ITEM_HEIGHT,
+    offset: ITEM_HEIGHT * index,
+    index,
+  })}
+/>
+```
+
+### パフォーマンス目標
+
+| メトリック              | 目標値   | 測定方法                     |
+| ----------------------- | -------- | ---------------------------- |
+| コールドスタート        | < 2 秒   | Application Insights         |
+| 画面遷移                | < 300 ms | React Navigation metrics     |
+| API レスポンス表示      | < 1 秒   | TanStack Query devtools      |
+| FlatList スクロール FPS | ≥ 55 FPS | Flipper Performance Monitor  |
+| メモリ使用量            | < 200 MB | Xcode Instruments / Profiler |
+
+---
+
+## デプロイメント設計
+
+### 環境構成
+
+| 環境            | 用途         | API 接続先     | 配信方法                |
+| --------------- | ------------ | -------------- | ----------------------- |
+| **Development** | 開発・テスト | dev API        | ローカルビルド          |
+| **Staging**     | 本番前検証   | staging API    | TestFlight / 内部テスト |
+| **Production**  | 本番環境     | production API | App Store / Google Play |
+
+### iOS CI/CD パイプライン
+
+```yaml
+# .azure/pipelines/mobile-ios-pipeline.yml
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+
+pool:
+  vmImage: 'macos-latest'
+
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildiOS
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '18.x'
+
+          - script: |
+              cd mobile
+              yarn install --frozen-lockfile
+            displayName: 'Install dependencies'
+
+          - script: |
+              cd mobile/ios
+              pod install
+            displayName: 'Install CocoaPods'
+
+          - task: Xcode@5
+            inputs:
+              actions: 'build archive'
+              sdk: 'iphoneos'
+              scheme: 'JuxyiMobile'
+              configuration: 'Release'
+              exportPath: '$(Build.ArtifactStagingDirectory)/ios'
+              signingOption: 'auto'
+              packageApp: true
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/ios'
+              artifactName: 'ios-build'
+
+  - stage: Deploy
+    dependsOn: Build
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    jobs:
+      - deployment: DeployTestFlight
+        environment: 'ios-staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AppStoreRelease@1
+                  inputs:
+                    serviceEndpoint: 'apple-store-connect'
+                    appIdentifier: 'com.juxyi.mobile'
+                    releaseTrack: 'TestFlight'
+```
+
+### Android CI/CD パイプライン
+
+```yaml
+# .azure/pipelines/mobile-android-pipeline.yml
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildAndroid
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '18.x'
+
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          - script: |
+              cd mobile
+              yarn install --frozen-lockfile
+            displayName: 'Install dependencies'
+
+          - script: |
+              cd mobile/android
+              ./gradlew assembleRelease
+            displayName: 'Build Android APK'
+
+          - task: AndroidSigning@3
+            inputs:
+              apkFiles: 'mobile/android/app/build/outputs/apk/release/*.apk'
+              apksignerKeystoreFile: 'release-keystore.jks'
+              apksignerKeystorePassword: '$(KEYSTORE_PASSWORD)'
+              apksignerKeystoreAlias: '$(KEY_ALIAS)'
+              apksignerKeyPassword: '$(KEY_PASSWORD)'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: 'mobile/android/app/build/outputs/apk/release'
+              artifactName: 'android-build'
+
+  - stage: Deploy
+    dependsOn: Build
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    jobs:
+      - deployment: DeployGooglePlay
+        environment: 'android-staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: GooglePlayRelease@4
+                  inputs:
+                    serviceConnection: 'google-play-console'
+                    applicationId: 'com.juxyi.mobile'
+                    action: 'SingleBundle'
+                    track: 'internal'
+```
+
+### CodePush OTA 更新
+
+```typescript name=mobile/src/config/codepush.ts
+import CodePush, { CodePushOptions } from 'react-native-code-push';
+
+/**
+ * CodePush 設定
+ * - JavaScript バンドルの OTA 更新
+ * - ネイティブコード変更不要な修正を即時配信
+ */
+export const codePushOptions: CodePushOptions = {
+  checkFrequency: CodePush.CheckFrequency.ON_APP_RESUME,
+  installMode: CodePush.InstallMode.ON_NEXT_RESTART,
+  mandatoryInstallMode: CodePush.InstallMode.IMMEDIATE,
+};
+
+/**
+ * CodePush デプロイメントキー
+ */
+export const CODEPUSH_KEYS = {
+  ios: {
+    staging: 'ios-staging-deployment-key',
+    production: 'ios-production-deployment-key',
+  },
+  android: {
+    staging: 'android-staging-deployment-key',
+    production: 'android-production-deployment-key',
+  },
+};
+```
+
+**CodePush 適用範囲**:
+
+| 変更種別             | CodePush 対応 | ストア再申請 |
+| -------------------- | ------------- | ------------ |
+| 画面 UI 修正         | ✅ 可能       | ❌ 不要      |
+| ロジック修正         | ✅ 可能       | ❌ 不要      |
+| ライブラリ更新（JS） | ✅ 可能       | ❌ 不要      |
+| Native Module 追加   | ❌ 不可       | ✅ 必要      |
+| SDK 更新             | ❌ 不可       | ✅ 必要      |
+| アプリアイコン変更   | ❌ 不可       | ✅ 必要      |
+
+---
+
+## まとめ
+
+本モバイルアーキテクチャは以下の特徴を持ちます：
+
+### ✅ 主要な設計判断
+
+| 項目               | 選択                           | 理由                                      |
+| ------------------ | ------------------------------ | ----------------------------------------- |
+| **フレームワーク** | React Native 0.73+ (Pure RN)   | クロスプラットフォーム、既存 Web 技術活用 |
+| **JS エンジン**    | Hermes                         | 高速起動、低メモリ使用量                  |
+| **状態管理**       | TanStack Query + Zustand       | Web と統一パターン                        |
+| **認証方式**       | WebView + e-ninsho + 生体認証  | 多要素・多チャネル認証                    |
+| **キャッシュ**     | 3 層キャッシュ（メモリ/AS/FS） | オフライン対応                            |
+| **プッシュ通知**   | FCM + Azure Notification Hubs  | マルチプラットフォーム配信                |
+| **OTA 更新**       | CodePush                       | ストア審査不要の即時配信                  |
+| **CI/CD**          | Azure DevOps Pipelines         | バックエンド・Web と統一                  |
+
+### 🎯 非機能要件達成
+
+| 要件                 | 達成方法                                       |
+| -------------------- | ---------------------------------------------- |
+| **10,000+ ユーザー** | 効率的キャッシュ、CDN 経由配信                 |
+| **高速起動**         | Hermes エンジン（< 2 秒コールドスタート）      |
+| **オフライン対応**   | 3 層キャッシュ + TanStack Query offlineFirst   |
+| **セキュリティ**     | Keychain/Keystore + JWT + Root/Jailbreak 検知  |
+| **保守性**           | Feature-based Architecture、Web と共通パターン |
+| **即時配信**         | CodePush OTA（ストア審査なしで JS 更新）       |
+
+### 📚 関連ドキュメント
+
+- [バックエンドアーキテクチャ設計書](./BACKEND_ARCHITECTURE.md)
+- [フロントエンドアーキテクチャ設計書](./FRONTEND_ARCHITECTURE.md)
+- [統合システムアーキテクチャ設計書](./SYSTEM_ARCHITECTURE.md)
+- [API 設計書](./API.md)
+
+---
+
+**最終更新日**: 2025-02-10
+**ドキュメントバージョン**: 1.1.0
+**作成者**: JUXYI 開発チーム

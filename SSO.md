@@ -169,3 +169,46 @@ sequenceDiagram
         MyPageAPI-->>Browser: 11b. 302 Redirect<br/>→ https://mypage.example.com/login?error=expired
     end
 ```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as ユーザー
+    participant App as マイアプリ<br/>(WebView)
+    participant API as マイページバックエンド<br/>(API + DB)
+    participant Browser as 外部ブラウザ<br/>(Safari/Chrome)
+
+    Note over App: ◆前提：WebView内で<br/>ユーザーは既にログイン済み
+
+    %% Step 1: User Action
+    User->>App: 1. 「あさひマイページ」ボタンを押す
+
+    %% Step 2: Request Ticket
+    App->>API: 2. POST /api/create-ticket<br/>(Header: Authorization: 現在のセッション)
+
+    %% Step 3: Generate Ticket
+    API->>API: 3. トークンの有効性を確認
+    API->>API: 4. ユニークな「Ticket」を発行<br/>(例: t_8f9a2s1d...)<br/>DBへ保存（有効期限: 1分）
+
+    %% Step 4: Return Ticket
+    API-->>App: 5. Ticketを返却 (t_8f9a2s1d...)
+
+    %% Step 5: Open External Browser
+    App->>Browser: 6. 外部ブラウザを起動<br/>URL: https://mypage.co.jp/sso/login?ticket=t_8f9a2s1d...
+
+    %% Step 6: Browser Access
+    Browser->>API: 7. GET https://mypage.co.jp/sso/login?ticket=t_8f9a2s1d...
+
+    %% Step 7: Verify Ticket
+    API->>API: 8. DBでTicketの存在と有効期限を確認
+
+    alt Ticketが有効かつ未使用の場合 (正常ルート)
+        API->>API: 9. Web用のセッション/Cookieを発行
+        API->>API: 10. DBからTicketを削除(または使用済フラグ更新)<br/>(再利用防止：ワンタイムチケット)
+        API-->>Browser: 11. 302 Redirect -> /home (マイページ)
+    else Ticketが無効、または期限切れの場合 (エラー)
+        API-->>Browser: 11b. 302 Redirect -> /login (ログイン画面へ)
+    end
+
+    Note over Browser: ◆Webサイトでの自動ログイン完了
+```
